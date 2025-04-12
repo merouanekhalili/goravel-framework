@@ -182,9 +182,6 @@ func (s *ManagerTestSuite) TestDriver_NotSupported() {
 	s.mockConfig.On("GetString", "session.driver").Return("not_supported")
 	// Ensure "session.drivers" mock (from setup) does NOT contain "not_supported"
 
-	driver, _ := s.manager.Driver(s.manager.getDefaultDriver())
-	s.manager.BuildSession(driver)
-
 	// Request the unsupported driver
 	driver, err := s.manager.Driver() // Gets name "not_supported" from mock
 	s.NotNil(err)
