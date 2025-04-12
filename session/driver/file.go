@@ -1,94 +1,221 @@
+// path/to/goravel/framework/session/driver/file.go
 package driver
 
 import (
+	"fmt" // Using standard log; replace with framework's logger if preferred
 	"os"
 	"path/filepath"
 	"sync"
 
+	sessioncontract "github.com/goravel/framework/contracts/session"
+	"github.com/goravel/framework/facades" // Use facade to access config
 	"github.com/goravel/framework/support/carbon"
 	"github.com/goravel/framework/support/file"
 )
 
+// File implements the session.Driver interface using the filesystem.
 type File struct {
-	path    string
-	minutes int
-	mu      sync.RWMutex
+	path    string       // Directory where session files are stored
+	minutes int          // Session lifetime in minutes
+	mu      sync.RWMutex // Protects access during file operations
 }
 
-func NewFile(path string, minutes int) *File {
+func newFile(path string, minutes int) (*File, error) {
+	if path == "" {
+		return nil, fmt.Errorf("session file path cannot be empty")
+	}
+
 	return &File{
 		path:    path,
 		minutes: minutes,
+	}, nil
+}
+
+// FileDriverFactory creates an instance of the file session driver using framework config.
+// This function matches the 'func() (session.Driver, error)' signature for config 'via'.
+func FileDriverFactory() (sessioncontract.Driver, error) {
+	config := facades.Config() // Resolve config service using facade
+
+	lifetime := config.GetInt("session.lifetime")
+	filesPath := config.GetString("session.files")
+
+	if filesPath == "" {
+		return nil, fmt.Errorf("session.files path is not configured; required for file session driver") // Return error: driver cannot function without a path
 	}
+
+	// Call the internal constructor which handles path creation/checking
+	instance, err := newFile(filesPath, lifetime)
+	if err != nil {
+		// Error already logged by newFile if path creation failed
+		return nil, err // Propagate the error
+	}
+	return instance, nil
 }
 
 func (f *File) Close() error {
 	return nil
 }
 
+// Destroy removes a session file by its ID.
 func (f *File) Destroy(id string) error {
-	f.mu.Lock()
+	f.mu.Lock() // Exclusive lock for delete operation
 	defer f.mu.Unlock()
 
-	return file.Remove(f.getFilePath(id))
-}
+	if f.path == "" {
 
-func (f *File) Gc(maxLifetime int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	cutoffTime := carbon.Now(carbon.UTC).SubSeconds(maxLifetime)
-
-	if !file.Exists(f.path) {
-		return nil
+		return fmt.Errorf("session path not configured") // Return error
 	}
 
-	return filepath.Walk(f.path, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	filePath := f.getFilePath(id)
 
-		if !info.IsDir() && info.ModTime().Before(cutoffTime.StdTime()) {
-			return os.Remove(path)
-		}
+	err := file.Remove(filePath)
+	// Log errors unless the file simply didn't exist
+	if err != nil && !os.IsNotExist(err) {
 
-		return nil
-	})
-}
-
-func (f *File) Open(string, string) error {
+		return fmt.Errorf("failed to destroy session file '%s': %w", id, err)
+	}
 	return nil
 }
 
-func (f *File) Read(id string) (string, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	path := f.getFilePath(id)
-	if file.Exists(path) {
-		modified, err := file.LastModified(path, carbon.UTC)
-		if err != nil {
-			return "", err
-		}
-		if modified.After(carbon.Now(carbon.UTC).SubMinutes(f.minutes).StdTime()) {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return "", err
-			}
-			return string(data), nil
-		}
-	}
-
-	return "", nil
-}
-
-func (f *File) Write(id string, data string) error {
-	f.mu.Lock()
+// Gc performs garbage collection, removing expired session files.
+func (f *File) Gc(maxLifetime int) error {
+	f.mu.Lock() // Exclusive lock for GC potentially deleting many files
 	defer f.mu.Unlock()
 
-	return file.PutContent(f.getFilePath(id), data)
+	if f.path == "" {
+
+		return fmt.Errorf("session path not configured") // Return error
+	}
+	if maxLifetime <= 0 {
+
+		return fmt.Errorf("invalid maxLifetime for GC: %d", maxLifetime)
+	}
+
+	cutoffTime := carbon.Now(carbon.UTC).SubSeconds(maxLifetime)
+
+	var filesRemoved int
+	var errorsEncountered int
+
+	err := filepath.Walk(f.path, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			// Log errors during walk (e.g., permissions) and potentially stop
+
+			errorsEncountered++
+			// Decide whether to stop walking on error. Returning the error stops.
+			// Returning nil allows it to potentially continue with other files/subdirs.
+			// Let's continue if possible.
+			return nil // Continue walking if possible
+		}
+
+		// Skip the root directory itself and any subdirectories immediately under it.
+		// Session files should be directly in f.path, not in subdirs.
+		if info.IsDir() {
+			if path == f.path {
+				return nil // Allow entering the root directory
+			}
+			// Skip any nested directories found.
+
+			return filepath.SkipDir
+		}
+
+		//Convert ModTime to utc
+		modTime := info.ModTime().UTC()
+
+		// Check modification time against cutoff for actual files
+		if modTime.Before(cutoffTime.StdTime()) {
+
+			removeErr := os.Remove(path)
+			if removeErr != nil && !os.IsNotExist(removeErr) {
+
+				errorsEncountered++
+				// Continue GC even if one file fails to delete
+			} else if removeErr == nil {
+				filesRemoved++
+			}
+		}
+		return nil // Continue walking
+	})
+
+	// Return the error from filepath.Walk if it terminated due to an issue.
+	if err != nil {
+
+		return fmt.Errorf("session GC failed for path '%s': %w", f.path, err)
+	}
+	return nil
+}
+
+// Open is part of the interface but typically a no-op for file/database drivers.
+func (f *File) Open(savePath string, sessionName string) error {
+	// Could potentially use savePath to override f.path if needed, but typically ignored.
+	return nil
+}
+
+// Read retrieves session data from a file by ID. Returns empty string if not found or expired.
+func (f *File) Read(id string) (string, error) {
+	f.mu.RLock() // Read lock is sufficient
+	defer f.mu.RUnlock()
+
+	if f.path == "" {
+
+		// Consistent behavior: return "" and no error if path is missing.
+		return "", nil
+	}
+
+	filePath := f.getFilePath(id)
+
+	// 1. Check existence first (optimization)
+	if !file.Exists(filePath) {
+		return "", nil // Not found, return empty string, no error
+	}
+
+	// 2. Check if expired (based on modification time)
+	if f.minutes > 0 { // Only check expiry if lifetime is positive
+		modified, err := file.LastModified(filePath, carbon.UTC)
+		if err != nil {
+
+			// Treat as unreadable if mod time fails
+			return "", fmt.Errorf("failed to check session expiry for '%s': %w", id, err)
+		}
+
+		expiryTime := carbon.Now(carbon.UTC).SubMinutes(f.minutes)
+		if modified.Before(expiryTime.StdTime()) {
+
+			// Don't delete here, let GC handle it. Return as if not found.
+			return "", nil
+		}
+	} // else: lifetime is 0 or negative, session never expires based on time
+
+	// 3. Read the file content
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+
+		return "", fmt.Errorf("failed to read session data for '%s': %w", id, err)
+	}
+
+	return string(data), nil
+}
+
+// Write saves session data to a file by ID.
+func (f *File) Write(id string, data string) error {
+	f.mu.Lock() // Exclusive lock for write operation
+	defer f.mu.Unlock()
+
+	if f.path == "" {
+		return fmt.Errorf("cannot write session file: session path is not configured")
+	}
+
+	filePath := f.getFilePath(id)
+
+	err := file.PutContent(filePath, data)
+	if err != nil {
+		return fmt.Errorf("failed to write session data for '%s': %w", id, err)
+	}
+	return nil
 }
 
 func (f *File) getFilePath(id string) string {
 	return filepath.Join(f.path, id)
 }
+
+// Ensure File implements the Driver interface at compile time.
+var _ sessioncontract.Driver = (*File)(nil)
